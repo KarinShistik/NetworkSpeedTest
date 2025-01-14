@@ -24,13 +24,12 @@ def broadcast_offers(udp_port, tcp_port):
             while True:
                 offer_packet = struct.pack("!IBHH", MAGIC_COOKIE, OFFER_MSG_TYPE, udp_port, tcp_port)
                 udp_sock.sendto(offer_packet, ('<broadcast>', 13117))  # Predefined broadcast port
-                print("Broadcasted offer packet.")
                 time.sleep(1)  # Wait 1 second before sending the next offer
     except Exception as e:
         print(f"Error broadcasting offers: {e}")
 
 
-def handle_client(client_socket, protocol, udp_address=None, file_size=1_000_000, segment_size=1024):
+def handle_client(client_socket, protocol, data=10, udp_address=None, segment_size=1024):
     """
     Handles communication with a single client.
 
@@ -38,30 +37,39 @@ def handle_client(client_socket, protocol, udp_address=None, file_size=1_000_000
         client_socket (socket.socket): The client's connection socket (TCP only).
         protocol (str): Specifies whether the connection is TCP or UDP.
         udp_address (tuple): The client's address (IP, port) for UDP communication.
-        file_size (int): Total file size to transfer in bytes.
+        data (int): Total file size to transfer in bytes.
         segment_size (int): Size of each segment in bytes for UDP.
     """
     try:
         if protocol == "TCP":
-            data = client_socket.recv(1024).decode().strip()
             requested_file_size = int(data)
-            print(f"Client requested {requested_file_size} bytes over TCP.")
-            client_socket.sendall(b"x" * requested_file_size)
-            print("TCP file transfer completed successfully.")
+            header = struct.pack("!IBQ", MAGIC_COOKIE, PAYLOAD_MSG_TYPE, requested_file_size)
+            payload = b"x" * requested_file_size
+            message = header + payload
+            client_socket.sendall(message)
 
         elif protocol == "UDP" and udp_address:
-            total_segments = file_size // segment_size
-            print(f"Starting UDP transfer: {total_segments} segments of {segment_size} bytes each.")
+            if data <= segment_size:
+                total_segments = 0  # No full segments
+                remaining_bytes = data  # The entire data is in one segment
+            else:
+                total_segments = data // segment_size
+                remaining_bytes = data % segment_size
 
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
                 for segment_num in range(total_segments):
                     payload_packet = struct.pack(
-                        "!IBQQ", MAGIC_COOKIE, PAYLOAD_MSG_TYPE, total_segments, segment_num
+                        "!IBQQ", MAGIC_COOKIE, PAYLOAD_MSG_TYPE, total_segments + (1 if remaining_bytes > 0 else 0),
+                        segment_num
                     ) + b"x" * segment_size
                     udp_sock.sendto(payload_packet, udp_address)
-                    print(f"Sent UDP segment {segment_num + 1}/{total_segments} to {udp_address}.")
 
-            print(f"UDP transfer to {udp_address} completed.")
+                if remaining_bytes > 0 or total_segments == 0:
+                    segment_num = total_segments  # Use the next segment number
+                    payload_packet = struct.pack(
+                        "!IBQQ", MAGIC_COOKIE, PAYLOAD_MSG_TYPE, total_segments + 1, segment_num
+                    ) + b"x" * remaining_bytes
+                    udp_sock.sendto(payload_packet, udp_address)
 
     except Exception as e:
         print(f"Error while communicating with client: {e}")
@@ -100,24 +108,46 @@ def main():
     print(f"Server started, listening on IP address {server_ip}")
 
     # Create a socket for broadcasting offers
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
-        udp_sock.bind(('', udp_port))
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # Create a TCP socket
+    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # Open the socket
+    try:
+        tcp_sock.bind(('', tcp_port))  # Bind to the selected port
+        tcp_sock.listen()
+        tcp_port = tcp_sock.getsockname()[1]  # Get the dynamically assigned TCP port
+
+        udp_sock.bind(('0.0.0.0', udp_port))
         udp_port = udp_sock.getsockname()[1]
 
-    # Start broadcasting offers in a separate thread
-    threading.Thread(target=broadcast_offers, args=(udp_port, tcp_port), daemon=True).start()
-
-    # Create a socket for TCP communication
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock:
-        tcp_sock.bind(('0.0.0.0', tcp_port))
-        tcp_port = tcp_sock.getsockname()[1]
-        tcp_sock.listen()  # Start listening for incoming connections
-        print(f"Server is running on TCP port {tcp_port}. Waiting for clients...")
+        # Start broadcasting offers in a separate thread
+        threading.Thread(target=broadcast_offers, args=(udp_port, tcp_port), daemon=True).start()
+        threads = []
 
         while True:
-            client_sock, addr = tcp_sock.accept()
-            print(f"Accepted connection from {addr}.")
-            threading.Thread(target=handle_client, args=(client_sock, "TCP"), daemon=True).start()
+            #
+            client_sock_tcp, addr_tcp = tcp_sock.accept()
+            data = client_sock_tcp.recv(1024).decode().strip()
+            tcp_thread = threading.Thread(target=handle_client, args=(client_sock_tcp, "TCP", data), daemon=True)
+            threads.append(tcp_thread)
+            tcp_thread.start()
+
+            data, addr_udp = udp_sock.recvfrom(1024)  # Receive data from the client (1024 is the buffer size)
+            magic, message_type, file_size = struct.unpack('!IBQ', data)
+            udp_thread = threading.Thread(target=handle_client, args=(udp_sock, "UDP", file_size, addr_udp), daemon=True)
+            threads.append(udp_thread)
+            udp_thread.start()
+
+            # Clean up finished threads
+            threads = [t for t in threads if t.is_alive()]
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+    finally:
+        if tcp_sock:  # Ensure the socket was created
+            tcp_sock.close()
+        if udp_sock:  # Ensure the socket was created
+            udp_sock.close()
 
 
 if __name__ == "__main__":
