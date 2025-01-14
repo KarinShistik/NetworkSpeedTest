@@ -3,30 +3,31 @@ import struct
 import threading
 import time
 
-
 MAGIC_COOKIE = 0xabcddcba
 OFFER_MSG_TYPE = 0x2
 REQUEST_MSG_TYPE = 0x3
 PAYLOAD_MSG_TYPE = 0x4
+BROADCAST_PORT = 13117
+BUFFER_SIZE = 1024
 
 
 def listen_for_offers(server_info):
     """
     Listens for server broadcast offers and updates the server_info dictionary.
-
     Args:
-        server_info (dict): Shared dictionary to store server details (IP, UDP port, TCP port).
+        server_info (dict): A shared dictionary to store the server's IP, UDP port, and TCP port.
+    Behavior:
+        - Binds to a UDP broadcast port and waits for server offer packets.
+        - Validates received packets using `MAGIC_COOKIE` and `OFFER_MSG_TYPE`.
+        - Updates `server_info` with server details upon receiving a valid packet.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_sock.bind(('', 13117))  # Bind to the broadcast port
-
-        print("Listening for offers...")
+        udp_sock.bind(('', BROADCAST_PORT))  # Bind to the broadcast port
+        print("Client started, listening for offer requests...")
         while True:
-            data, addr = udp_sock.recvfrom(1024)
-            if len(data) < 10:
-                continue
-            magic, msg_type, udp_port, tcp_port = struct.unpack("!IBHH", data[:10])
+            data, addr = udp_sock.recvfrom(BUFFER_SIZE)
+            magic, msg_type, udp_port, tcp_port = struct.unpack("!IBHH", data)
 
             if magic == MAGIC_COOKIE and msg_type == OFFER_MSG_TYPE:
                 server_ip = addr[0]
@@ -34,49 +35,55 @@ def listen_for_offers(server_info):
                 server_info['udp_port'] = udp_port
                 server_info['tcp_port'] = tcp_port
                 print(f"Received offer from {server_ip}")  # Log the received offer
-                print(f"Offer details: UDP port {udp_port}, TCP port {tcp_port}")
                 break
-
 
 
 def tcp_download(server_ip, tcp_port, file_size, conn_id):
     """
-    Handles TCP file download.
-
+    Handles file download using TCP and measures transfer speed.
     Args:
-        server_ip (str): Server's IP address.
-        tcp_port (int): Server's TCP port.
-        file_size (int): Requested file size in bytes.
-        conn_id (int): Connection ID for display purposes.
+        server_ip (str): The server's IP address.
+        tcp_port (int): The server's TCP port.
+        file_size (int): The size of the file to download in bytes.
+        conn_id (int): A unique connection ID for identifying the transfer.
+    Behavior:
+        - Establishes a TCP connection to the server.
+        - Sends the requested file size to the server.
+        - Receives data in chunks until the requested file size is reached.
+        - Calculates and logs the total transfer time and speed.
     """
     try:
         with socket.create_connection((server_ip, tcp_port)) as sock:
             sock.sendall(f"{file_size}\n".encode())
             start_time = time.time()
-
             received_data = 0
             while received_data < file_size:
-                data = sock.recv(1024)
+                data = sock.recv(BUFFER_SIZE)
+                magic, msg_type, file_len = struct.unpack("!IBQ", data[:13])
                 if not data:
                     break
                 received_data += len(data)
 
             elapsed_time = time.time() - start_time
             speed = (received_data * 8) / elapsed_time  # bits per second
-            print(f"TCP transfer #{conn_id} finished, total time: {elapsed_time:.2f} seconds, total speed: {speed:.2f} bits/second.")
+            print(f"TCP transfer #{conn_id} finished, total time: {elapsed_time:.2f} seconds, total speed: {speed:.2f} bits/second")
     except Exception as e:
         print(f"Error in TCP connection #{conn_id}: {e}")
 
 
 def udp_download(server_ip, udp_port, file_size, conn_id):
     """
-    Handles UDP file download.
-
+    Handles file download using UDP and measures transfer speed.
     Args:
-        server_ip (str): Server's IP address.
-        udp_port (int): Server's UDP port.
-        file_size (int): Requested file size in bytes.
-        conn_id (int): Connection ID for display purposes.
+        server_ip (str): The server's IP address.
+        udp_port (int): The server's UDP port.
+        file_size (int): The size of the file to download in bytes.
+        conn_id (int): A unique connection ID for identifying the transfer.
+    Behavior:
+        - Sends a file request packet to the server with the specified file size.
+        - Receives data packets from the server, validating their headers.
+        - Tracks received data, discarded packets, and calculates packet loss percentage.
+        - Logs total time, transfer speed, and packet success percentage.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -90,17 +97,12 @@ def udp_download(server_ip, udp_port, file_size, conn_id):
             total_segments = 0
             while True:
                 try:
-                    data, _ = sock.recvfrom(2048)
-                    if len(data) < 20:
-                        discarded_packets += 1
-                        continue
-
-                    magic, msg_type, total_segments, current_segment = struct.unpack("!IBQQ", data[:20])
+                    data, _ = sock.recvfrom(BUFFER_SIZE*2)
+                    magic, msg_type, total_segments, current_segment = struct.unpack("!IBQQ", data[:21])
                     if magic != MAGIC_COOKIE or msg_type != PAYLOAD_MSG_TYPE:
                         discarded_packets += 1
                         continue
-
-                    received_data += len(data) - 20  # Subtract header size
+                    received_data += len(data)  # Subtract header size
                 except socket.timeout:
                     break
 
@@ -108,18 +110,19 @@ def udp_download(server_ip, udp_port, file_size, conn_id):
             speed = (received_data * 8) / elapsed_time  # bits per second
             loss_percentage = 100 - ((total_segments - discarded_packets) / (total_segments or 1)) * 100
             print(f"UDP transfer #{conn_id} finished, total time: {elapsed_time:.2f} seconds, total speed: {speed:.2f} bits/second, "
-                  f"percentage of packets received successfully: {100 - loss_percentage:.2f}%.")
+                  f"percentage of packets received successfully: {100 - loss_percentage:.2f}%")
     except Exception as e:
         print(f"Error in UDP connection #{conn_id}: {e}")
 
 
 def get_file_size():
     """
-    Prompts the user to enter the file size and its unit (GB, MB, KB, or B).
-    Converts the file size to bytes.
-
+    Prompts the user to enter a file size and its unit, then converts it to bytes.
     Returns:
-        int: File size in bytes.
+        int: The file size in bytes.
+    Behavior:
+        - Prompts the user for the file size (numeric) and unit (GB, MB, KB, or B).
+        - Validates input and converts the size to bytes using a unit map.
     """
     unit_map = {
         "GB": 1e9,
@@ -127,19 +130,37 @@ def get_file_size():
         "KB": 1e3,
         "B": 1
     }
+
     while True:
         try:
-            size = float(input("Enter the file size to download: "))
+            # Prompt user for file size
+            size = input("Enter the file size to download: ").strip()
+            if not size.replace('.', '', 1).isdigit():
+                raise ValueError("Invalid size. Please enter a numeric value.")
+            size = float(size)
+
+            # Prompt user for unit
             unit = input("Enter the unit (GB, MB, KB, or B): ").strip().upper()
             if unit not in unit_map:
                 raise ValueError("Invalid unit. Please enter GB, MB, KB, or B.")
+
+            # Return file size in bytes
             return int(size * unit_map[unit])
+
         except ValueError as e:
-            print(e)
-            continue
+            print(f"Error: {e}")
+            print("Please try again.")
 
 
 def main():
+    """
+    Client for link-speed measuring program.
+    Behavior:
+        - Prompts the user for file size, number of TCP connections, and UDP connections.
+        - Calls `listen_for_offers` to find a server and gather its connection details.
+        - Spawns threads to handle TCP and UDP downloads based on user input.
+        - Waits for all threads to complete and logs transfer results.
+    """
     while True:
         # Phase 1: Startup
         file_size = get_file_size()
@@ -174,7 +195,7 @@ def main():
         for t in threads:
             t.join()
 
-        print("All transfers complete, listening to offer requests.")
+        print("All transfers complete, listening to offer requests")
 
 
 if __name__ == "__main__":
