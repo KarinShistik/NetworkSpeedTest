@@ -7,7 +7,8 @@ import time  # Used for delays (e.g., to periodically broadcast)
 MAGIC_COOKIE = 0xabcddcba  # Unique identifier to validate packet integrity
 OFFER_MSG_TYPE = 0x2  # Indicates the packet is an "offer" from the server
 PAYLOAD_MSG_TYPE = 0x4  # Indicates the packet contains file payload
-
+BUFFER_SIZE = 1024
+BROADCAST_PORT = 13117
 
 def broadcast_offers(udp_port, tcp_port):
     """
@@ -23,7 +24,7 @@ def broadcast_offers(udp_port, tcp_port):
 
             while True:
                 offer_packet = struct.pack("!IBHH", MAGIC_COOKIE, OFFER_MSG_TYPE, udp_port, tcp_port)
-                udp_sock.sendto(offer_packet, ('<broadcast>', 13117))  # Predefined broadcast port
+                udp_sock.sendto(offer_packet, ('<broadcast>', BROADCAST_PORT))  # Predefined broadcast port
                 time.sleep(1)  # Wait 1 second before sending the next offer
     except Exception as e:
         print(f"Error broadcasting offers: {e}")
@@ -124,14 +125,14 @@ def main():
         threads = []
 
         while True:
-            #
+
             client_sock_tcp, addr_tcp = tcp_sock.accept()
-            data = client_sock_tcp.recv(1024).decode().strip()
+            data = client_sock_tcp.recv(BUFFER_SIZE).decode().strip()
             tcp_thread = threading.Thread(target=handle_client, args=(client_sock_tcp, "TCP", data), daemon=True)
             threads.append(tcp_thread)
             tcp_thread.start()
 
-            data, addr_udp = udp_sock.recvfrom(1024)  # Receive data from the client (1024 is the buffer size)
+            data, addr_udp = udp_sock.recvfrom(BUFFER_SIZE)  # Receive data from the client (1024 is the buffer size)
             magic, message_type, file_size = struct.unpack('!IBQ', data)
             udp_thread = threading.Thread(target=handle_client, args=(udp_sock, "UDP", file_size, addr_udp), daemon=True)
             threads.append(udp_thread)
